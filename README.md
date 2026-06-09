@@ -17,7 +17,7 @@ Production LLM applications are expensive to run and difficult to debug. A singl
 
 This project provides a **lightweight, self-hosted observability layer** that sits between your application code and the LLM API. It captures every request, estimates its cost in real time using a local pricing table, records latency, and exposes aggregate metrics through a FastAPI service. It is designed to be embedded in any Python backend as an SDK wrapper or plugged in as middleware — no external SaaS dependency required.
 
-This is a **Wave 1** project in the [showcase portfolio](../workspace-map.md). It provides the monitoring infrastructure that downstream AI projects (`rag-evaluation-lab`, `hermes-agent-framework`, `ai-support-simulator`) can integrate with to track their own LLM spend.
+This is a **Wave 1** project in the [showcase portfolio](https://github.com/FishRaposo/operator-shared-core/blob/main/docs/workspace-map.md). It provides the monitoring infrastructure that downstream AI projects ([`rag-evaluation-lab`](https://github.com/FishRaposo/rag-evaluation-lab), [`aria-agent`](https://github.com/FishRaposo/aria-agent), [`ai-support-simulator`](https://github.com/FishRaposo/ai-support-simulator)) can integrate with to track their own LLM spend.
 
 ## What It Demonstrates
 
