@@ -1,19 +1,40 @@
-PRICING_MAP = {
-    "gpt-4": {"input_cost_per_1k": 0.03, "output_cost_per_1k": 0.06},
-    "gpt-4o": {"input_cost_per_1k": 0.005, "output_cost_per_1k": 0.015},
-    "gpt-4o-mini": {"input_cost_per_1k": 0.00015, "output_cost_per_1k": 0.0006},
-    "gpt-3.5-turbo": {"input_cost_per_1k": 0.0015, "output_cost_per_1k": 0.002},
-    "claude-3-opus": {"input_cost_per_1k": 0.015, "output_cost_per_1k": 0.075},
-    "claude-3-5-sonnet": {"input_cost_per_1k": 0.003, "output_cost_per_1k": 0.015},
-    "claude-3-haiku": {"input_cost_per_1k": 0.00025, "output_cost_per_1k": 0.00125},
-}
+"""Thin cost wrapper that delegates to ``shared_core.pricing``.
 
-FALLBACK_RATES = {"input_cost_per_1k": 0.005, "output_cost_per_1k": 0.015}
+``shared_core.pricing`` is the single source of truth for per-model token
+pricing across the workspace. This module is a backwards-compatible shim so
+existing callers (the SDK, dashboard, tests) keep importing ``estimate_cost``
+and ``PRICING_MAP`` from ``llm_monitor.pricing`` while the actual rates live in
+``shared_core``. ``PRICING_MAP`` is derived from the shared registry and
+expressed in the project's legacy per-1k-token shape for display purposes only.
+"""
+
+from shared_core.pricing import (
+    MODEL_PRICING,
+    calculate_cost,
+    register_pricing,  # noqa: F401  (re-exported for convenience)
+)
 
 
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Estimates the dollar cost of an LLM query."""
-    rates = PRICING_MAP.get(model, FALLBACK_RATES)
-    input_cost = (input_tokens / 1000.0) * rates["input_cost_per_1k"]
-    output_cost = (output_tokens / 1000.0) * rates["output_cost_per_1k"]
-    return round(input_cost + output_cost, 8)
+    """Estimate the USD cost of a single LLM query.
+
+    Delegates the math to :func:`shared_core.pricing.calculate_cost`, the
+    canonical pricing source. Rounded to 8 decimals to match historical output.
+    """
+    return round(calculate_cost(model, input_tokens, output_tokens), 8)
+
+
+def _build_pricing_map() -> dict:
+    """Project the shared per-1M registry into a per-1k display table."""
+    out: dict = {}
+    for model, entry in MODEL_PRICING.items():
+        out[model] = {
+            "input_cost_per_1k": round(entry.input_per_1m / 1000.0, 8),
+            "output_cost_per_1k": round(entry.output_per_1m / 1000.0, 8),
+        }
+    return out
+
+
+# Derived view of shared_core pricing in per-1k-token units (display only).
+# NOT the source of truth — cost math always flows through calculate_cost.
+PRICING_MAP = _build_pricing_map()

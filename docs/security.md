@@ -1,26 +1,36 @@
-# Security Boundaries & Rules - LLM Cost & Latency Monitor
+# Security Boundaries & Rules — LLM Cost & Latency Monitor
 
-This document outlines the security parameters, boundaries, and data-handling rules for the LLM Cost & Latency Monitor.
-
----
-
-## 1. Secrets Isolation & Credentials Handling
-
-- **No API Provider Secrets**: The monitor service does NOT store, handle, or forward LLM provider API credentials (such as `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`).
-- **Telemetry Separation**: The Telemetry API is purely a monitoring sink. It is isolated from model generation pathways. If the monitor is compromised, active LLM provider API keys in client applications remain secure.
+Security parameters, boundaries, and data-handling rules.
 
 ---
 
-## 2. Personal Identifiable Information (PII) Protection
+## 1. Secrets isolation
 
-- **Length-Only Tracking**: By design, the `MonitoredLLMClient` tracks only the character count (`prompt_length`), input tokens, and output tokens. It **does not transmit the raw prompt text** or output text to the server.
-- **Zero-Storage of Payload Data**: Preventing prompt-text ingestion eliminates the risk of logging PII, credit card details, or proprietary business logic inside telemetry databases.
-- **Opt-in Hashing**: If request auditing is added, prompts must be hashed using SHA-256 before transmission.
+- **Provider keys live with the caller, not the sink.** The telemetry API (`/log`, `/metrics`, `/reports/daily`, `/budgets/alerts`) never receives, stores, or forwards `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`. Keys are only read by `MonitoredLLMClient` inside the *client* process when the real provider path is used.
+- **SecretStr handling.** Config keys are typed as `pydantic.SecretStr` in `BaseAppConfig`; `shared_core.llm` unwraps them only at call time, keeping them out of logs and `repr()` output.
+- **Offline by default.** With no keys set, the SDK runs mocked — there is no credential surface at all in CI/demos.
 
 ---
 
-## 3. API Boundary Protections
+## 2. PII protection
 
-- **Payload Validation**: The `/log` endpoint must validate incoming JSON structure (requiring numeric validation on cost, latency, and tokens) to prevent buffer overflows or numeric injections.
-- **Write Path Access**: In multi-tenant systems, client SDKs must authenticate using a write-only API token, restricting telemetry generation to registered workloads.
-- **Rate Limiting**: Telemetry endpoints are high-throughput and must be protected by rate-limiting middleware to prevent denial-of-service (DoS) attempts that could consume available worker memory.
+- **No raw prompt/response text is persisted.** Telemetry records `prompt_length`, `input_tokens`, `output_tokens`, `cost_usd`, `latency_ms`, `prompt_version`, and an optional `error` string — never the prompt or completion body. This eliminates the risk of logging PII or proprietary content in the telemetry database.
+- **Error strings are truncated** to 500 chars before persistence (`storage_db.py`), limiting accidental leakage of payload fragments embedded in exception messages.
+- **Prompt versions are labels, not content** — safe to store and group on.
+
+---
+
+## 3. API boundary protections
+
+- **Schema validation.** `POST /log` is validated by the `TelemetryPayload` Pydantic model: numeric fields are non-negative (`ge=0`), types are enforced, and malformed bodies return `422` before touching the store.
+- **Query validation.** `/budgets/alerts` thresholds and `/reports/daily` parameters are validated (`ge=0.0`, typed) at the framework boundary.
+- **Correlation IDs.** `RequestLoggingMiddleware` assigns/propagates an `X-Correlation-ID` per request for auditability.
+
+---
+
+## 4. Known gaps & recommended hardening (showcase scope)
+
+- **No authentication / authorization.** Endpoints are open. For production, place behind an API gateway and require a **write-only token** for `/log` and a read token for metrics/reports.
+- **No built-in rate limiting.** Telemetry ingestion is high-throughput; add `shared_core.ratelimit` or gateway-level limits to prevent DoS / memory exhaustion (see failure-modes §2).
+- **Transport.** Terminate TLS at a proxy; do not expose the service directly.
+- **Budget data sensitivity.** Aggregate spend may be commercially sensitive; restrict `/metrics`, `/reports/daily`, and `/dashboard` to authorized readers.

@@ -1,20 +1,20 @@
-.PHONY: install dev test lint format typecheck docker-up docker-down demo clean help worker migrate upgrade
+.PHONY: install dev test lint format typecheck docker-up docker-down demo examples clean help worker migrate upgrade
 
 install: ## Install shared-core and project dependencies
-	pip install -e ../shared-core
-	pip install -r requirements.txt
+	pip install -e "../shared-core[dev,docparse,embeddings]"
+	pip install -e ".[dev]"
 
 dev: ## Start the FastAPI development server
-	python src/llm_monitor/main.py
+	python -m llm_monitor.main
 
 test: ## Run unit tests with pytest
 	pytest
 
 lint: ## Lint source code with ruff
-	ruff check .
+	ruff check src/llm_monitor tests examples
 
 format: ## Auto-format source code with ruff
-	ruff format .
+	ruff format src/llm_monitor tests examples
 
 typecheck: ## Static type checking with pyright
 	pyright src/
@@ -28,8 +28,12 @@ docker-down: ## Stop all Docker containers
 demo: ## Run the demonstration script
 	python examples/run_demo.py
 
-worker: ## Start the Celery worker
-	celery -A src.llm_monitor.worker worker --loglevel=info
+examples: ## Run both integration examples (wrapped FastAPI + RAG)
+	python examples/wrapped_fastapi_app.py
+	python examples/wrapped_rag_app.py
+
+worker: ## Start the Celery worker (requires a running Redis broker)
+	celery -A llm_monitor.worker worker --loglevel=info
 
 migrate: ## Generate a new Alembic migration
 	alembic revision --autogenerate -m "auto"

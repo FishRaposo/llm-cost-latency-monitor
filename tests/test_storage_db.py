@@ -1,95 +1,155 @@
-from unittest.mock import MagicMock
+"""Tests for the SQLAlchemy-backed telemetry store using in-memory SQLite.
+
+A real SQLite engine exercises the persistence path end-to-end (commit, query,
+aggregation) without a Postgres server, so persistence is genuinely verified
+rather than mocked.
+"""
 
 import pytest
+from shared_core.database import DatabaseManager
+
 from llm_monitor.storage_db import DatabaseTelemetryStore
 
 
 @pytest.fixture
-def mock_session():
-    session = MagicMock()
-    session.query.return_value.filter.return_value.all.return_value = []
-    return session
+def db_manager():
+    mgr = DatabaseManager("sqlite:///:memory:")
+    mgr.create_tables()
+    return mgr
 
 
 @pytest.fixture
-def mock_session_factory(mock_session):
-    def factory():
-        yield mock_session
-
-    return factory
+def store(db_manager):
+    return DatabaseTelemetryStore(db_manager.get_session)
 
 
-@pytest.fixture
-def store(mock_session_factory):
-    return DatabaseTelemetryStore(mock_session_factory)
+def _payload(**overrides):
+    base = {
+        "model": "gpt-4",
+        "prompt_length": 40,
+        "input_tokens": 10,
+        "output_tokens": 20,
+        "cost_usd": 0.0006,
+        "latency_ms": 120.0,
+        "prompt_version": "v1",
+        "error": None,
+    }
+    base.update(overrides)
+    return base
 
 
 class TestDatabaseTelemetryStore:
-    def test_log_request_commits(self, store, mock_session):
-        store.log_request({
-            "model": "gpt-4",
-            "prompt_length": 100,
-            "input_tokens": 25,
-            "output_tokens": 50,
-            "cost_usd": 0.003,
-            "latency_ms": 200.0,
-        })
-        mock_session.commit.assert_called_once()
+    def test_log_request_persists(self, store):
+        store.log_request(_payload())
+        agg = store.get_aggregates()
+        assert agg["total_calls"] == 1
+        assert agg["total_cost"] == pytest.approx(0.0006)
 
-    def test_log_request_rolls_back_on_error(self, store, mock_session):
-        mock_session.commit.side_effect = Exception("DB write error")
-        with pytest.raises(Exception, match="DB write error"):
-            store.log_request({"model": "gpt-4", "prompt_length": 10, "input_tokens": 2, "output_tokens": 3, "cost_usd": 0.0, "latency_ms": 10.0})
-        mock_session.rollback.assert_called_once()
+    def test_get_aggregates_empty(self, store):
+        agg = store.get_aggregates()
+        assert agg["total_calls"] == 0
+        assert agg["total_cost"] == 0.0
+        assert agg["avg_latency"] == 0.0
+        assert agg["by_model"] == {}
 
-    def test_get_aggregates_empty(self, store, mock_session):
-        mock_session.query.return_value.scalar.return_value = 0
-        result = store.get_aggregates()
-        assert result["total_calls"] == 0
-        assert result["total_cost"] == 0.0
-        assert result["avg_latency"] == 0.0
+    def test_by_model_breakdown(self, store):
+        store.log_request(_payload(model="gpt-4"))
+        store.log_request(_payload(model="gpt-3.5-turbo", cost_usd=0.0001))
+        agg = store.get_aggregates()
+        assert agg["total_calls"] == 2
+        assert "gpt-4" in agg["by_model"]
+        assert "gpt-3.5-turbo" in agg["by_model"]
+        assert agg["by_model"]["gpt-4"]["calls"] == 1
 
-    def test_get_aggregates_with_data(self, store, mock_session):
-        from unittest.mock import MagicMock
+    def test_error_rate_tracked(self, store):
+        store.log_request(_payload())
+        store.log_request(_payload(error="TimeoutError: boom"))
+        agg = store.get_aggregates()
+        assert agg["error_rate"] == 0.5
 
-        call_counts = {"count": 0}
+    def test_prompt_version_cost_breakdown(self, store):
+        store.log_request(_payload(prompt_version="v1"))
+        store.log_request(_payload(prompt_version="v2", cost_usd=0.0009))
+        agg = store.get_aggregates()
+        assert set(agg["cost_by_prompt_version"]) == {"v1", "v2"}
 
-        def mock_scalar():
-            call_counts["count"] += 1
-            idx = call_counts["count"]
-            if idx == 1:
-                return 5
-            elif idx == 2:
-                return 0.025
-            elif idx == 3:
-                return 150.0
-            return 0
+    def test_logs_property_roundtrip(self, store):
+        store.log_request(_payload(model="claude-3-haiku"))
+        logs = store.logs
+        assert len(logs) == 1
+        assert logs[0]["model"] == "claude-3-haiku"
+        assert logs[0]["prompt_version"] == "v1"
 
-        mock_scalar_mock = MagicMock()
-        mock_scalar_mock.scalar = mock_scalar
+    def test_summary_has_percentiles(self, store):
+        for latency in (50.0, 100.0, 150.0, 200.0):
+            store.log_request(_payload(latency_ms=latency))
+        summary = store.summary()
+        assert summary["total_requests"] == 4
+        assert summary["p95_latency_ms"] > 0
+        assert summary["p99_latency_ms"] > 0
 
-        mock_groupby = MagicMock()
-        mock_groupby.group_by.return_value.all.return_value = [
-            ("gpt-4", 5, 0.025, 200)
-        ]
+    def test_session_factory_generator_is_cleaned_up(self):
+        """The factory generator's finally/close must run deterministically.
 
-        mock_orderby = MagicMock()
-        mock_orderby.order_by.return_value.all.return_value = [
-            (100.0,), (150.0,), (200.0,),
-        ]
+        Regression: ``_session()`` previously did ``next(factory())`` and
+        abandoned the generator, leaving its cleanup to the GC. Driving it via
+        ``contextlib.closing`` must run the generator's ``finally`` block.
+        """
 
-        def query_side_effect(*args, **kwargs):
-            idx = mock_session.query.call_count
-            if idx <= 3:
-                return mock_scalar_mock
-            elif idx == 4:
-                return mock_groupby
-            else:
-                return mock_orderby
+        class TrackingSession:
+            def __init__(self):
+                self.closed = False
 
-        mock_session.query.side_effect = query_side_effect
-        mock_session.query.call_count = 0
+            def query(self, *a, **k):
+                raise AssertionError("not used in this test")
 
-        result = store.get_aggregates()
-        assert result["total_calls"] == 5
-        assert "gpt-4" in result["by_model"]
+            def add(self, *a):
+                pass
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        session = TrackingSession()
+        finally_ran = {"value": False}
+
+        def factory():
+            try:
+                yield session
+            finally:
+                finally_ran["value"] = True
+
+        store = DatabaseTelemetryStore(factory)
+        store.log_request(_payload())
+
+        assert finally_ran["value"] is True
+        assert session.closed is True
+
+    def test_rollback_on_bad_session(self):
+        class BoomSession:
+            def add(self, *a):
+                pass
+
+            def commit(self):
+                raise RuntimeError("db write error")
+
+            def rollback(self):
+                self.rolled_back = True
+
+            def close(self):
+                pass
+
+        boom = BoomSession()
+
+        def factory():
+            yield boom
+
+        store = DatabaseTelemetryStore(factory)
+        with pytest.raises(RuntimeError, match="db write error"):
+            store.log_request(_payload())
+        assert getattr(boom, "rolled_back", False) is True

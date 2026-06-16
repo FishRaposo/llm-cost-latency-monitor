@@ -5,45 +5,63 @@
 ![Celery](https://img.shields.io/badge/Celery-5.3+-37814a?logo=celery&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
 ![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)
+![Prometheus](https://img.shields.io/badge/Prometheus-metrics-E6522C?logo=prometheus&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-## An observability layer that wraps LLM API calls to track token usage, estimate cost, measure latency, and surface aggregate metrics — so you can answer "how much did that prompt cost?" before the invoice arrives.
+> An observability layer that wraps LLM API calls to track token usage, estimate cost, measure latency, track prompt versions and errors, generate daily reports, and fire budget alerts — so you can answer "how much did that prompt cost?" before the invoice arrives.
 
 ---
 
 ## Why This Exists
 
-Production LLM applications are expensive to run and difficult to debug. A single prompt experiment can cost dollars, yet most teams discover their spend only at the end of the billing cycle. Latency varies wildly across models and prompt lengths, errors are transient, and there is no standard way to compare cost-per-quality across providers.
+Production LLM applications are expensive and hard to debug. A single prompt experiment can cost dollars, yet most teams discover their spend only at the end of the billing cycle. Latency varies wildly across models and prompt lengths, errors are transient, and there is no standard way to compare cost-per-quality across providers or prompt versions.
 
-This project provides a **lightweight, self-hosted observability layer** that sits between your application code and the LLM API. It captures every request, estimates its cost in real time using a local pricing table, records latency, and exposes aggregate metrics through a FastAPI service. It is designed to be embedded in any Python backend as an SDK wrapper or plugged in as middleware — no external SaaS dependency required.
+This project is a **lightweight, self-hosted observability layer** that sits between your application and the LLM API. It captures every request, estimates cost in real time, records latency, tracks which prompt version produced it, flags errors, and exposes everything through a FastAPI service — plus a Prometheus endpoint, daily CSV/JSON reports, and budget alerts. Embed it as an SDK wrapper or plug it in as middleware; no external SaaS required.
 
-This is a **Wave 1** project in the [showcase portfolio](https://github.com/FishRaposo/operator-shared-core/blob/main/docs/workspace-map.md). It provides the monitoring infrastructure that downstream AI projects ([`rag-evaluation-lab`](https://github.com/FishRaposo/rag-evaluation-lab), [`aria-agent`](https://github.com/FishRaposo/aria-agent), [`ai-support-simulator`](https://github.com/FishRaposo/ai-support-simulator)) can integrate with to track their own LLM spend.
+It is **offline-first**: it boots and runs with **no database and no API keys** (deterministic mock LLM responses, in-memory store). Provide a database and it persists; provide API keys and it calls real providers.
+
+This is a **Wave 1** project in the showcase portfolio. It provides the monitoring infrastructure that downstream AI projects can integrate with to track their own LLM spend.
 
 ## What It Demonstrates
 
-- **SDK Wrapper Pattern** — `MonitoredLLMClient` wraps any LLM call, capturing telemetry without changing the caller's interface
-- **FastAPI Middleware Design** — `telemetry_middleware` intercepts every HTTP request for latency instrumentation
-- **Cost Estimation Engine** — `PRICING_MAP` with per-model input/output token rates and `estimate_cost()` calculation
-- **In-Memory Metrics Aggregation** — `InMemoryTelemetryStore` collects telemetry and computes aggregates (total calls, total cost, average latency)
-- **Structured Error Handling** — `BaseApplicationError` hierarchy from `shared-core` with JSON error responses
-- **Health Check Pattern** — `/health` endpoint probing both database and Redis connectivity with degraded-state reporting
-- **Background Task Infrastructure** — Celery worker skeleton with Redis broker, ready for async report generation
+- **SDK Wrapper Pattern** — `MonitoredLLMClient` wraps any LLM call, capturing telemetry (cost, latency, tokens, prompt version, errors) without changing the caller's interface. Mock by default; real OpenAI/Anthropic when keyed.
+- **Single Source of Truth for Pricing** — cost math is delegated entirely to `shared_core.pricing`; the local `pricing.py` is a thin wrapper over it.
+- **Unified Metric Aggregation** — totals, per-model, per-prompt-version, p50/p95/p99 latency and error rate come from `shared_core.llmmetrics.LLMMetrics`, shared by both the in-memory and DB-backed stores.
+- **DB Persistence with Graceful Fallback** — telemetry persists to PostgreSQL by default via a `db_available` probe, with a transparent in-memory fallback so tests and demos run with no database.
+- **Prometheus + Structured Logging Middleware** — `shared_core.metrics.MetricsMiddleware` and `RequestLoggingMiddleware` instrument every request; a `/metrics/prometheus` endpoint exposes scrapeable metrics.
+- **Background Reporting** — a real Celery worker generates daily reports and evaluates budgets, wired to HTTP endpoints and importable without a broker.
+- **Budget Alerts** — USD thresholds (total and per-model) produce structured, flagged alerts.
 
 ## Architecture
 
 ```mermaid
 graph TD
     App["Your Application"] -->|wraps calls| SDK["MonitoredLLMClient<br/>(sdk.py)"]
-    SDK -->|estimates cost| Pricing["PRICING_MAP<br/>(pricing.py)"]
-    SDK -->|logs telemetry| Store["InMemoryTelemetryStore<br/>(storage.py)"]
-    Store -->|serves| API["FastAPI Service<br/>(main.py)"]
-    API -->|GET /metrics| Metrics["Aggregate Metrics"]
-    API -->|POST /log| Ingest["External Telemetry Ingest"]
-    API -->|middleware| MW["telemetry_middleware<br/>(middleware.py)"]
-    API -->|health| HC["GET /health"]
-    HC -->|probes| DB[(PostgreSQL)]
-    HC -->|probes| Redis[(Redis)]
-    Worker["Celery Worker<br/>(worker.py)"] -.->|future: async reports| Redis
+    SDK -->|mock or real| Provider{{"mocked_response?"}}
+    Provider -->|yes| Sim["Deterministic sim"]
+    Provider -->|no + key| Real["shared_core.llm<br/>LLMClientFactory"]
+    SDK -->|cost via| Pricing["shared_core.pricing<br/>(pricing.py wrapper)"]
+    SDK -->|telemetry| Store["Telemetry Store"]
+
+    subgraph Store selection
+        Store -->|db_available| DBStore["DatabaseTelemetryStore<br/>(storage_db.py)"]
+        Store -->|fallback| MemStore["InMemoryTelemetryStore<br/>(storage.py)"]
+    end
+    DBStore --> PG[(PostgreSQL)]
+
+    Store -->|aggregates| Metrics["shared_core.llmmetrics<br/>LLMMetrics"]
+
+    API["FastAPI Service (main.py)"] --> Store
+    API -->|POST /log| Ingest["Telemetry ingest"]
+    API -->|GET /metrics| Summary["JSON summary"]
+    API -->|GET /metrics/prometheus| Prom["Prometheus text"]
+    API -->|GET /reports/daily| Reports["reports.py (JSON/CSV)"]
+    API -->|GET /budgets/alerts| Budgets["budgets.py (USD thresholds)"]
+    API -->|GET /health| HC["Health"]
+
+    Worker["Celery Worker (worker.py)"] -.->|generate_daily_report| Reports
+    Worker -.->|check_budget| Budgets
+    Worker -.-> Redis[(Redis broker)]
 ```
 
 ## Tech Stack
@@ -52,128 +70,112 @@ graph TD
 |-----------|-----------|---------------|
 | API Framework | FastAPI + Uvicorn | Async-native, automatic OpenAPI docs, middleware support |
 | SDK Client | Pure Python | Zero-dependency wrapper, portable across projects |
-| Cost Engine | Static pricing map | No external API calls needed for estimates |
-| Database | PostgreSQL 16 (pgvector) | Shared infrastructure across portfolio projects |
-| Cache / Broker | Redis 7 | Celery message broker + future metrics caching |
-| Task Queue | Celery 5.3+ | Async report generation and scheduled summaries |
+| Cost Engine | `shared_core.pricing` | Single, override-able source of truth for per-model token pricing |
+| Aggregation | `shared_core.llmmetrics` | Shared percentile/error-rate engine used by all stores |
+| Persistence | PostgreSQL 16 + SQLAlchemy | Durable telemetry; Alembic-managed schema |
+| Metrics | `prometheus_client` | Scrapeable `/metrics/prometheus` endpoint |
+| Cache / Broker | Redis 7 | Celery message broker |
+| Task Queue | Celery 5.3+ | Async daily reports and budget checks |
 | Config | pydantic-settings | Type-safe environment variable loading |
-| Logging | Loguru via shared-core | Structured logging with service name tagging |
-| Lint / Format | Ruff | Single tool for linting (E, W, F, I, C, B rules) and formatting |
-| Type Checking | Pyright | Strict mode for `src/` |
-| Testing | Pytest | FastAPI TestClient integration |
-| Shared Library | [`shared-core`](../shared-core/) | Config, database, redis, logging, error base classes |
+| Logging | Loguru via shared-core | Structured logging + correlation IDs |
+| Lint / Format | Ruff | Linting (E, W, F, I, C, B) and formatting |
+| Testing | Pytest | FastAPI TestClient + in-memory SQLite |
+| Shared Library | `shared-core` v1.3.0 | config, database, redis, logging, errors, metrics, pricing, llmmetrics, llm, tasks, embeddings, testing |
 
 ## Local Setup
 
 ```bash
-# Enter project directory
 cd llm-cost-latency-monitor
 
-# Copy environment template
+# Copy environment template (optional — it runs offline without it)
 cp .env.example .env
 
-# Start PostgreSQL and Redis containers
-make docker-up
-
-# Install shared-core and project dependencies
+# Install shared-core (with extras) and the project
 make install
 
 # Run the API server (default: http://localhost:8000)
 make dev
+# OpenAPI docs at http://localhost:8000/docs
 
-# Verify it works
-curl http://localhost:8000/health
+# Optional: start PostgreSQL + Redis for persistence and the worker
+make docker-up
 ```
 
-## Demo
+The service runs **with or without** a database. With `make docker-up` (or any reachable `DATABASE_URL`), telemetry persists to PostgreSQL and survives restarts; otherwise it uses the in-memory store.
 
-The demo script simulates two monitored LLM requests (GPT-4 and GPT-3.5-turbo) using the `MonitoredLLMClient` SDK wrapper, then prints aggregate telemetry:
+## Demo
 
 ```bash
 make demo
 ```
 
-Expected output:
+The demo (`examples/run_demo.py`) simulates a batch of monitored LLM requests across models and prompt versions (no network, no keys), then prints aggregate telemetry, a daily report (JSON + CSV), and a forced budget alert. Two further integration examples are provided:
 
+```bash
+make examples   # runs both of the below
+python examples/wrapped_fastapi_app.py   # a FastAPI app whose /chat endpoint is monitored
+python examples/wrapped_rag_app.py       # a RAG pipeline (offline embeddings) whose generation is monitored
 ```
---- Simulating Monitored LLM Requests ---
-Accumulated telemetry metrics:
-Total Calls: 2
-Total Estimated Cost: $0.000XXX
-Average Latency: ~150.00ms
-```
-
-The demo does not call any real LLM APIs — `MonitoredLLMClient.generate()` uses a mocked response with a 150ms simulated delay. Token counts are estimated at 1 token per 4 characters.
 
 ## Tests
 
 ```bash
-make test
+make test        # pytest  (91 tests, no network / no DB required)
+make lint        # ruff check src/llm_monitor tests examples
+make format      # ruff format ...
 ```
 
-Current test coverage:
-
-- **`test_core.py`** — Verifies the `/health` endpoint returns HTTP 200, the correct service name (`llm-cost-latency-monitor`), and a `dependencies` object reporting database/redis status
-
-Tests use FastAPI's `TestClient` for synchronous HTTP testing without a running server.
+Coverage spans: SDK (mock/real/error paths, prompt versions), pricing delegation to `shared_core`, `LLMMetrics`-backed aggregation, both stores (in-memory + SQLite-backed DB store), the `db_available` probe, daily reports (JSON + CSV), budget alerts, the Celery worker tasks, every API endpoint (success + error), and a smoke test that the demo and both examples run.
 
 ## API Reference
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Returns service health with database and Redis connectivity status |
-| `POST` | `/log` | Accepts a telemetry payload `dict` and stores it in-memory |
-| `GET` | `/metrics` | Returns aggregate metrics: `total_calls`, `total_cost`, `avg_latency` |
+| `POST` | `/log` | Ingest a telemetry record (model, tokens, cost, latency, prompt_version, error) |
+| `GET` | `/metrics` | Aggregate JSON summary: totals, per-model, per-prompt-version, p50/p95/p99, error rate |
+| `GET` | `/metrics/prometheus` | Prometheus text exposition of HTTP request metrics |
+| `GET` | `/reports/daily?day=YYYY-MM-DD&format=json\|csv` | Daily cost/latency report |
+| `GET` | `/budgets/alerts?threshold_usd=&per_model_threshold_usd=` | USD budget evaluation with flagged alerts |
+| `GET` | `/dashboard?format=json\|text\|html` | Human-readable dashboard view |
+| `GET` | `/health` | Service health with database and Redis connectivity |
 
-### Example: Log Telemetry
-
-```bash
-curl -X POST http://localhost:8000/log \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4","input_tokens":100,"output_tokens":50,"cost_usd":0.006,"latency_ms":230,"timestamp":1700000000}'
-```
-
-### Example: Get Metrics
+### Example
 
 ```bash
+curl -X POST http://localhost:8000/log -H "Content-Type: application/json" -d '{
+  "model": "gpt-4o", "prompt_length": 120, "input_tokens": 30,
+  "output_tokens": 60, "cost_usd": 0.00105, "latency_ms": 240, "prompt_version": "v2"
+}'
+
 curl http://localhost:8000/metrics
-# {"total_calls": 1, "total_cost": 0.006, "avg_latency": 230.0}
+curl "http://localhost:8000/reports/daily?format=csv"
+curl "http://localhost:8000/budgets/alerts?threshold_usd=1.0"
 ```
 
 ## Configuration
 
-Key environment variables from `.env.example`:
-
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `APP_NAME` | `llm-cost-latency-monitor` | Service identifier in logs and health checks |
-| `ENV` | `development` | Runtime environment flag |
-| `DEBUG` | `true` | Enable debug-level diagnostics |
+| `DATABASE_URL` | `postgresql+psycopg://...` | PostgreSQL connection; in-memory fallback if unreachable |
+| `REDIS_URL` / `CELERY_BROKER_URL` | `redis://localhost:6379/0` | Redis broker for the Celery worker |
+| `BUDGET_THRESHOLD_USD` | `10.0` | Total-spend USD budget for `/budgets/alerts` |
+| `BUDGET_PER_MODEL_THRESHOLD_USD` | unset | Optional per-model USD budget |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | placeholders | Enable the real provider path; omit to run mocked |
 | `LOG_LEVEL` | `INFO` | Loguru log threshold |
-| `DATABASE_URL` | `postgresql+psycopg://postgres:postgres@localhost:5432/postgres` | PostgreSQL connection string |
-| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection for Celery broker and caching |
-| `OPENAI_API_KEY` | *(placeholder)* | Required when using real OpenAI API calls |
-| `ANTHROPIC_API_KEY` | *(placeholder)* | Required when using real Anthropic API calls |
 
 ## Known Limitations
 
-- **In-memory storage only** — `InMemoryTelemetryStore` loses all data on restart; no PostgreSQL persistence yet
-- **Mocked LLM calls** — `MonitoredLLMClient.generate()` simulates responses with `time.sleep(0.15)` instead of calling real APIs
-- **Approximate token counting** — Uses `len(text) // 4` as a rough heuristic instead of tiktoken or provider-specific tokenizers
-- **Static pricing table** — `PRICING_MAP` in `pricing.py` is hardcoded for 3 models (gpt-4, gpt-3.5-turbo, claude-3-opus); unknown models default to $0.00
-- **No authentication** — `/log` and `/metrics` endpoints are open; anyone on the network can push telemetry or read metrics
-- **No prompt version tracking** — The `prompt_version` field mentioned in the build plan is not yet implemented
-- **Celery worker is a stub** — `sample_background_task` is a placeholder that adds two numbers; no real async tasks defined
-- **No authentication** — `/log` and `/metrics` endpoints are open; anyone on the network can push telemetry or read metrics
+- **Approximate token counting** for mocked calls — `len(text) // 4`; real calls use the provider's reported usage.
+- **No authentication** — `/log` and read endpoints are open; add an API gateway / auth proxy for production.
+- **Prometheus endpoint covers HTTP metrics** (request count/duration), not per-model cost gauges — the JSON `/metrics` and `/reports/daily` carry the cost/latency detail.
+- **Single-process in-memory store** is not shared across replicas; use the database backend for multi-instance deployments.
+- **Budget alerts are pull-based** (evaluated on request / via the Celery task); no push notifications/webhooks yet.
 
 ## Roadmap
 
-- **Phase 1 — MVP** *(current)*: SDK wrapper, pricing engine, in-memory store, FastAPI telemetry API, health checks
-- **Phase 2 — Display-Ready**: PostgreSQL persistence, Pydantic request/response models, prompt version tracking, daily summary report via Celery, p95 latency calculation, cost-by-model breakdown
-- **Phase 3 — Showcase**: Dashboard UI, model comparison view, budget alert thresholds, CSV export, integration examples with `rag-evaluation-lab` and `hermes-agent-framework`
-- **Phase 4 — Future**: Real LLM API integration (OpenAI, Anthropic), tiktoken-based token counting, streaming response support, OpenTelemetry export, webhook notifications
+- **Phase 1 — MVP** *(done)*: SDK wrapper, pricing, store, telemetry API, health.
+- **Phase 2 — Display-Ready** *(done)*: DB persistence with fallback, prompt-version + error tracking, p50/p95/p99, daily reports (CSV/JSON), budget alerts, Prometheus + request-logging middleware, real Celery tasks, two integration examples.
+- **Phase 3 — Showcase**: dashboard UI, per-model cost gauges in Prometheus, webhook alerting, model-comparison views.
+- **Phase 4 — Future**: tiktoken-based token counting, streaming-response telemetry, OpenTelemetry export.
 
-See [docs/roadmap.md](docs/roadmap.md) for detailed milestone breakdowns.
-ook notifications
-
-See [docs/roadmap.md](docs/roadmap.md) for detailed milestone breakdowns.
+See [docs/roadmap.md](docs/roadmap.md) and [docs/EXECUTION_PLAN.md](docs/EXECUTION_PLAN.md) for detail.

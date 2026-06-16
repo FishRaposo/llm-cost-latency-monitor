@@ -1,47 +1,71 @@
-# Failure Modes & Mitigation - LLM Cost & Latency Monitor
+# Failure Modes & Mitigation — LLM Cost & Latency Monitor
 
-This document details anticipated failure modes, detection strategies, and mitigation pathways for the LLM Cost & Latency Monitor.
-
----
-
-## 1. Out-of-Memory (OOM) via Memory Store
-
-- **Cause**: Sustained high-throughput usage sends millions of logs to the API. Because `InMemoryTelemetryStore` accumulates events in a Python list (`self.logs`), RAM usage increases indefinitely.
-- **Impact**: The FastAPI worker process crashes due to OOM, dropping the service and failing all requests with 502/504 gateways.
-- **Detection**: 
-  - System memory usage alerts.
-  - Process exit codes matching memory limit terminations.
-- **Mitigation**: Restarting the service clears memory but drops historical metrics.
-- **Future Fix**: Implement a rolling list limit (e.g., store only the last 10,000 requests) or flush records to a database (PostgreSQL/ClickHouse) periodically in batches, clearing the in-memory array.
+Anticipated failure modes, detection, and mitigation.
 
 ---
 
-## 2. Model Pricing Defaulting to Zero
+## 1. Database unavailable at startup
 
-- **Cause**: The client application requests a model string not defined in `PRICING_MAP` (e.g., `gpt-4o`, `claude-3.5-sonnet`).
-- **Impact**: The cost calculations in `estimate_cost()` fallback to rates of `0.0`, resulting in a recorded cost of `$0.00` for that query. This skews total cost metrics.
-- **Detection**: `/metrics` aggregates report high query count but disproportionately low or zero total cost.
-- **Mitigation**: Update the `PRICING_MAP` dictionary in `pricing.py` with the correct model rates and redeploy.
-- **Future Fix**: Store pricing maps in a database table or Redis cache that can be updated dynamically via API, and return a default fallback cost (e.g., average token rate) instead of `$0.00` when a model is not matched.
+- **Cause**: PostgreSQL is unreachable or its driver is not installed.
+- **Impact**: **None to availability.** `db.check_db()` catches the failure, logs a warning, and the service falls back to `InMemoryTelemetryStore`. All endpoints keep working; telemetry simply is not persisted across restarts.
+- **Detection**: `GET /health` reports `database: offline` / status `degraded`; startup log shows "Database unavailable — falling back to in-memory telemetry store".
+- **Mitigation**: `make docker-up` (or fix `DATABASE_URL`) and restart; the next startup probe selects the DB store.
 
----
-
-## 3. Synchronous Network Overhead in Client App
-
-- **Cause**: If the client SDK is configured to perform a blocking HTTP POST to the monitor's `/log` endpoint within the execution thread.
-- **Impact**: Any network jitter, packet loss, or high latency on the monitor server will block the client application thread, directly increasing user-facing latency.
-- **Detection**: Client application latency logs show a massive spike in overall request times, even though the raw LLM generation latency (`latency_ms`) remains constant.
-- **Mitigation**: Re-route the `storage_callback` to fire asynchronously (e.g., using `asyncio` or threading) or log to a local file that is scraped out-of-band.
-- **Future Fix**: Build thread-safe, non-blocking queueing within the SDK client, batching telemetry updates and flushing them in the background.
+```mermaid
+flowchart LR
+    Probe{check_db} -->|ok| DB[Persist to PostgreSQL]
+    Probe -->|fail| Mem[In-memory store] --> Warn[Log warning + /health degraded]
+```
 
 ---
 
-## 4. Database / Redis Connectivity Degradation
+## 2. Unbounded in-memory growth (OOM)
 
-- **Cause**: Sibling Postgres or Redis containers go offline.
-- **Impact**: The `/health` endpoint responds with status `"degraded"`, but the core telemetry `/log` and `/metrics` routes continue to operate normally (since the telemetry store is currently in-memory).
-- **Detection**:
-  - `GET /health` returns status degraded.
-  - Log traces show connection warnings.
-- **Mitigation**: Run `make docker-up` to restart background infrastructure.
-- **Future Fix**: Build alert integrations that notify operators when dependencies drop, separating critical API paths from secondary reporting structures.
+- **Cause**: Sustained high-throughput logging while running on the in-memory store accumulates records in `self.logs` and the backing `LLMMetrics`.
+- **Impact**: RAM grows until the worker is OOM-killed (502/504s).
+- **Detection**: System memory alerts; `total_calls` climbing without bound on a long-lived in-memory instance.
+- **Mitigation**: Run with the database backend (rows are durable, not all held for serving). Restart clears memory but drops unpersisted history.
+- **Future fix**: Cap the in-memory list (rolling window) and/or push aggregation into SQL so serving does not require loading every row.
+
+---
+
+## 3. Unknown model pricing
+
+- **Cause**: A model id not in `shared_core.pricing.MODEL_PRICING` (and not matched by prefix).
+- **Impact**: Cost uses the **conservative default** (5.0/15.0 per 1M tokens) — not `$0.00` — so spend is over- rather than under-counted, and a one-time warning is logged.
+- **Detection**: Log warning "No pricing for model '<x>'; using conservative default".
+- **Mitigation**: `shared_core.pricing.register_pricing(...)` or a JSON/YAML override file via `load_pricing_override`.
+
+---
+
+## 4. Real LLM call failure (provider error / no key)
+
+- **Cause**: Provider outage, rate limit, malformed request, or missing API key on the real path.
+- **Impact**: The SDK does **not** raise to the caller. It records `telemetry["error"]`, sets `output_tokens=0`, and returns an empty response, so the call is counted in the **error rate** rather than crashing the app.
+- **Detection**: `error_rate` rises on `/metrics`; `cost_by_prompt_version` and per-model breakdowns isolate the offending path; logs carry the exception string.
+- **Mitigation**: Inspect the error string, verify keys/quotas; the budget and report endpoints continue to function.
+
+---
+
+## 5. Prometheus dependency missing
+
+- **Cause**: `prometheus_client` not installed.
+- **Impact**: `MetricsRegistry`/`metrics_endpoint` raise a clear `ImportError` with install guidance; it is declared as a project dependency so this only occurs in a broken environment.
+- **Mitigation**: `pip install prometheus-client` (already in `requirements.txt` / `pyproject.toml`).
+
+---
+
+## 6. Celery broker (Redis) down
+
+- **Cause**: Redis offline.
+- **Impact**: The worker module still **imports** (broker is only contacted when a worker starts or a task is dispatched). Synchronous `/reports/daily` and `/budgets/alerts` are unaffected — only async scheduling is.
+- **Detection**: Worker connection errors; `GET /health` reports `redis: offline`.
+- **Mitigation**: `make docker-up`; until then use the synchronous HTTP endpoints.
+
+---
+
+## 7. Multi-replica in-memory divergence
+
+- **Cause**: Running several stateless replicas on the in-memory store.
+- **Impact**: Each replica sees only its own telemetry; `/metrics` is per-replica.
+- **Mitigation**: Use the database backend so all replicas read/write shared, durable state.

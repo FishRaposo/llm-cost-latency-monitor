@@ -31,6 +31,38 @@ services:
       timeout: 5s
       retries: 5
 
+  api:
+    build:
+      # The backend Dockerfile copies sibling shared-core/, so build from the
+      # parent directory that contains both repos.
+      context: ..
+      dockerfile: llm-cost-latency-monitor/Dockerfile
+    container_name: llm_monitor_api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./frontend
+      target: dev
+    container_name: llm_monitor_web
+    ports:
+      - "3000:3000"
+    environment:
+      # Browser-side requests target the host-published API port; the dashboard
+      # also falls back to bundled demo data if the API is unreachable.
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on:
+      - api
+
 volumes:
   pgdata:
   redisdata:

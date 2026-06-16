@@ -1,6 +1,7 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
+
 from llm_monitor.middleware import telemetry_middleware
 
 

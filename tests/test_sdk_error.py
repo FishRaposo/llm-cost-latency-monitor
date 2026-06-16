@@ -47,7 +47,15 @@ class TestSDKErrorHandling:
             mocked_response="4",
         )
         telemetry = result["telemetry"]
-        for field in ["model", "prompt_length", "input_tokens", "output_tokens", "cost_usd", "latency_ms", "timestamp"]:
+        for field in [
+            "model",
+            "prompt_length",
+            "input_tokens",
+            "output_tokens",
+            "cost_usd",
+            "latency_ms",
+            "timestamp",
+        ]:
             assert field in telemetry, f"Missing field: {field}"
 
     def test_cost_is_nonzero_for_known_model(self):

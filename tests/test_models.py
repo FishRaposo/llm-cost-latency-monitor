@@ -12,9 +12,19 @@ class TestLLMCallModel:
         assert hasattr(LLMCall, "output_tokens")
         assert hasattr(LLMCall, "cost_usd")
         assert hasattr(LLMCall, "latency_ms")
+        assert hasattr(LLMCall, "prompt_version")
+        assert hasattr(LLMCall, "error")
         assert hasattr(LLMCall, "id")
         assert hasattr(LLMCall, "created_at")
         assert hasattr(LLMCall, "updated_at")
+
+    def test_prompt_version_indexed_and_nullable(self):
+        col = LLMCall.__table__.columns["prompt_version"]
+        assert col.index is True
+        assert col.nullable is True
+
+    def test_error_nullable(self):
+        assert LLMCall.__table__.columns["error"].nullable is True
 
     def test_model_is_indexed(self):
         col = LLMCall.__table__.columns["model"]
